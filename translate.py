@@ -95,12 +95,15 @@ def translate_text(text_to_translate):
         raise Exception(f"API Error {response.status_code}: {response.text}")
     data = response.json()
     raw_text = data[0]["generated_text"].strip()
+    print(f"Raw text from API: {raw_text}")
     
     # Clean any English or markdown that might be included
     clean_text = clean_english_text(raw_text)
+    print(f"Clean text after removing English/markdown: {clean_text}")
     
     # Normalize punctuation for Tategaki
     final_text = normalize_punctuation(clean_text)
+    print(f"Final text after normalizing punctuation: {final_text}")
     
     return final_text
 
