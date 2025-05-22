@@ -502,4 +502,737 @@ def build_translation_prompt(text_to_translate, model_name=None):
         return (
             "あなたは優秀な日本語翻訳者です。次の英語の文章を日本語に翻訳してください。\n\n"
             "翻訳スタイルは日本の若者向けファンタジー小説（縦書き用）です。微妙な不思議さ、感情の深さ、"
-            "
+            "少し風変わりで物悲しい調子を表現しつつ、そのジャンルのために書かれたかのように自然に言葉が流れるようにしてください。\n\n"
+            "回答は日本語の翻訳のみを提供してください。フォーマット、説明、英語のテキストは含めないでください。\n\n"
+            "翻訳する文章：\n" + text_to_translate + "\n\n"
+            "日本語翻訳："
+        )
+
+def translate_text(text_to_translate, max_retries=3, retry_delay=5):
+    """Translate text with retry logic for API failures and model fallback"""
+    global HF_API_URL, HF_MODEL, TRANSLATE_TEMPLATE_En
+    
+    # Try with primary model first
+    current_model = HF_MODEL
+    models_to_try = [current_model] + BACKUP_MODELS
+    
+    # Check if environment variable template is available - if not, set a recommended one
+    if not TRANSLATE_TEMPLATE_En:
+        print("Note: TRANSLATE_TEMPLATE_En environment variable not set. Using default template.")
+        # You may want to suggest setting this environment variable
+        recommended_template = (
+            "[INST] You are a professional Japanese translator. Your task is to translate the following English text into natural, fluent Japanese.\n\n"
+            "Translation style: Young adult fantasy novel for vertical writing (tategaki).\n"
+            "Express subtle wonder, emotional depth, and a slightly melancholic tone.\n"
+            "Use appropriate Japanese punctuation (「」for quotes, 。for periods, etc).\n"
+            "Use natural Japanese expressions rather than literal translations.\n\n"
+            "IMPORTANT: Return ONLY the Japanese translation. No explanations or English text.\n\n"
+            "Text to translate: {text} [/INST]"
+        )
+        # We'll use this for now but won't permanently set the env var
+        TRANSLATE_TEMPLATE_En = recommended_template
+    
+    for model_index, model in enumerate(models_to_try):
+        # Build appropriate prompt for the model
+        prompt = build_translation_prompt(text_to_translate, model)
+        
+        payload = {
+            "inputs": prompt,
+            "parameters": {
+                "max_new_tokens": 1024,
+                "return_full_text": False,
+                "temperature": 0.7,
+                "top_p": 0.95,
+            },
+        }
+        
+        # Add model parameter if needed (some API endpoints require it)
+        if model_index > 0:  # For backup models
+            payload["model"] = model
+            print(f"Trying with backup model: {model}")
+        
+        for attempt in range(max_retries):
+            try:
+                # Print diagnostic info for the first attempt
+                if attempt == 0 and model_index == 0:
+                    print(f"Sending request to: {HF_API_URL}")
+                    print(f"With headers: {HEADERS}")
+                    if model_index > 0:
+                        print(f"Using model: {model}")
+                
+                response = requests.post(HF_API_URL, headers=HEADERS, json=payload, timeout=30)
+                
+                # Handle various response codes
+                if response.status_code == 429:  # Rate limit
+                    wait_time = retry_delay * (attempt + 1)  # Exponential backoff
+                    print(f"Rate limited. Waiting {wait_time} seconds before retrying...")
+                    time.sleep(wait_time)
+                    continue
+                    
+                if response.status_code != 200:
+                    print(f"API Error {response.status_code}: {response.text[:500]}...")
+                    if attempt == max_retries - 1 and model_index < len(models_to_try) - 1:
+                        # We'll try another model
+                        break
+                    elif attempt < max_retries - 1:
+                        # We'll retry with same model
+                        wait_time = retry_delay * (attempt + 1)
+                        print(f"Retrying in {wait_time} seconds...")
+                        time.sleep(wait_time)
+                        continue
+                    else:
+                        # Last model, last attempt
+                        raise Exception(f"All models failed. Last error: API Error {response.status_code}: {response.text}")
+                
+                # Parse the response
+                try:
+                    data = response.json()
+                    # Debug: print raw response structure
+                    if attempt == 0 and model_index == 0:
+                        print(f"Raw API response structure: {type(data)}")
+                        if isinstance(data, list) and len(data) > 0:
+                            print(f"First element type: {type(data[0])}")
+                            if hasattr(data[0], 'keys'):
+                                print(f"Keys: {list(data[0].keys())}")
+                    
+                    # Extract the text, handling different response formats
+                    if isinstance(data, list) and len(data) > 0 and isinstance(data[0], dict) and "generated_text" in data[0]:
+                        jp_text = data[0]["generated_text"].strip()
+                    elif isinstance(data, dict) and "choices" in data and len(data["choices"]) > 0:
+                        # Handle OpenAI-like format
+                        jp_text = data["choices"][0]["message"]["content"].strip()
+                    elif isinstance(data, dict) and "generated_text" in data:
+                        jp_text = data["generated_text"].strip()
+                    else:
+                        # If we can't extract using known formats, use the whole response
+                        jp_text = str(data)
+                    
+                    # Clean up any formatting or markers in the translation
+                    jp_text = clean_translation_output(jp_text)
+                    
+                    # If we got no Japanese text back after cleaning, retry
+                    if jp_text == "［翻訳エラー］":
+                        if attempt < max_retries - 1:
+                            print(f"No Japanese text found in response, retrying with clearer instructions...")
+                            # Try a different prompt format
+                            prompt = (
+                                "[重要] 以下の文章を日本語に翻訳してください。英語を含めないでください。" + 
+                                "英語: " + text_to_translate + " 日本語: "
+                            )
+                            payload["inputs"] = prompt
+                            continue
+                        elif model_index < len(models_to_try) - 1:
+                            # Try next model
+                            print(f"No Japanese text found with {model}, trying next model...")
+                            break
+                        else:
+                            # Last model, return whatever we have
+                            print(f"Warning: No Japanese text found in final response: {jp_text[:100]}...")
+                            return "［翻訳できませんでした］"  # Japanese for [could not translate]
+                    
+                    # Apply punctuation normalization and return successful translation
+                    return normalize_punctuation(jp_text)
+                
+                except (json.JSONDecodeError, KeyError, IndexError, TypeError) as e:
+                    print(f"Error parsing API response: {e}")
+                    print(f"Raw response: {response.text[:500]}...")
+                    
+                    if attempt < max_retries - 1:
+                        wait_time = retry_delay * (attempt + 1)
+                        print(f"Retrying in {wait_time} seconds...")
+                        time.sleep(wait_time)
+                        continue
+                    elif model_index < len(models_to_try) - 1:
+                        # Try next model
+                        break
+                    else:
+                        # Last model, last attempt
+                        raise Exception(f"Failed to parse response from all models: {e}")
+            
+            except requests.exceptions.RequestException as e:
+                print(f"Connection error: {e}")
+                if attempt < max_retries - 1:
+                    wait_time = retry_delay * (attempt + 1)
+                    print(f"Retrying in {wait_time} seconds...")
+                    time.sleep(wait_time)
+                elif model_index < len(models_to_try) - 1:
+                    # Try next model
+                    print(f"Connection error with {model}, trying next model...")
+                    break
+                else:
+                    # Last model, last attempt
+                    raise Exception(f"Connection failed for all models: {e}")
+    
+    # If we've exhausted all models and retries
+    raise Exception("Translation failed after trying all models")
+
+def calculate_eta(start_time, current_progress, total_items):
+    elapsed = time.time() - start_time
+    if current_progress == 0:  # Avoid division by zero
+        return "calculating..."
+    
+    progress_ratio = current_progress / total_items
+    if progress_ratio == 0:  # Avoid division by zero
+        return "calculating..."
+    
+    total_time_estimate = elapsed / progress_ratio
+    remaining_time = total_time_estimate - elapsed
+    
+    # Format as HH:MM:SS
+    return str(timedelta(seconds=int(remaining_time)))
+
+def save_checkpoint(checkpoint_data):
+    """Save checkpoint data to allow resuming translation"""
+    with open(CHECKPOINT_FILE, 'w', encoding='utf-8') as f:
+        json.dump(checkpoint_data, f)
+        f.flush()
+        os.fsync(f.fileno())  # Force write to disk
+
+def create_tategaki_document(output_text_file, output_docx_file="JP_tategaki.docx"):
+    """
+    Create a properly formatted tategaki (vertical writing) Word document
+    from the Japanese translation text file.
+    
+    Args:
+        output_text_file: Path to the text file containing Japanese translation
+        output_docx_file: Path to save the formatted Word document
+    """
+    try:
+        import docx
+        from docx.shared import Pt, Inches, Mm, RGBColor
+        from docx.enum.text import WD_PARAGRAPH_ALIGNMENT, WD_LINE_SPACING
+        from docx.enum.section import WD_ORIENT, WD_SECTION
+        import zipfile
+        import os
+        from lxml import etree
+        
+        print(f"Creating tategaki Word document: {output_docx_file}")
+        
+        # Read the translated content
+        with open(output_text_file, 'r', encoding='utf-8') as f:
+            content = f.read()
+            
+        # Split content by paragraphs (empty lines)
+        paragraphs = [p for p in content.split('\n\n') if p.strip()]
+        
+        # Create new document with proper Japanese settings
+        doc = docx.Document()
+        
+        # Set document language to Japanese
+        doc.styles['Normal'].font.name = 'MS Mincho'  # Classic Japanese font
+        doc.styles['Normal'].font.size = Pt(10.5)     # Standard Japanese novel size
+        doc.styles['Normal'].paragraph_format.line_spacing_rule = WD_LINE_SPACING.SINGLE
+        doc.styles['Normal'].paragraph_format.space_after = Pt(0)
+        doc.styles['Normal'].paragraph_format.space_before = Pt(0)
+        
+        # Set up sections for tategaki (vertical writing)
+        section = doc.sections[0]
+        section.orientation = WD_ORIENT.PORTRAIT
+        
+        # Standard Japanese novel B6 size (128mm x 182mm) - slightly smaller than JIS B6
+        section.page_width = Mm(128)
+        section.page_height = Mm(182)
+        
+        # Set appropriate margins for tategaki fiction
+        section.left_margin = Mm(20)   # Top margin in tategaki
+        section.right_margin = Mm(20)  # Bottom margin in tategaki
+        section.top_margin = Mm(15)    # Right margin in tategaki
+        section.bottom_margin = Mm(15) # Left margin in tategaki
+        
+        # Add title if the first paragraph appears to be a title (short paragraph)
+        if paragraphs and len(paragraphs[0]) < 30:  # Typically titles are short
+            title_paragraph = doc.add_paragraph()
+            title_paragraph.alignment = WD_PARAGRAPH_ALIGNMENT.CENTER
+            title_run = title_paragraph.add_run(paragraphs[0])
+            title_run.font.size = Pt(14)
+            title_run.font.bold = True
+            # Add proper spacing after title
+            title_paragraph.paragraph_format.space_after = Pt(24)
+            paragraphs = paragraphs[1:]  # Remove title from content to process
+            
+            # Add subtitle if second paragraph is also short
+            if paragraphs and len(paragraphs[0]) < 40:
+                subtitle_paragraph = doc.add_paragraph()
+                subtitle_paragraph.alignment = WD_PARAGRAPH_ALIGNMENT.CENTER
+                subtitle_run = subtitle_paragraph.add_run(paragraphs[0])
+                subtitle_run.font.size = Pt(12)
+                subtitle_run.italic = True
+                subtitle_paragraph.paragraph_format.space_after = Pt(36)
+                paragraphs = paragraphs[1:]
+        
+        # Add content paragraphs with proper Japanese formatting
+        for i, para_text in enumerate(paragraphs):
+            para = doc.add_paragraph()
+            
+            # Special formatting for chapter beginnings (typically shorter paragraphs)
+            if len(para_text) < 40 and para_text.strip().startswith('第') or '章' in para_text[:10]:
+                para.alignment = WD_PARAGRAPH_ALIGNMENT.CENTER
+                run = para.add_run(para_text.strip())
+                run.font.size = Pt(12)
+                run.bold = True
+                para.paragraph_format.space_before = Pt(24)
+                para.paragraph_format.space_after = Pt(24)
+            else:
+                # Regular paragraph
+                run = para.add_run(para_text.strip())
+                para.paragraph_format.first_line_indent = Pt(10.5)  # Standard indentation for Japanese fiction
+                
+                # Add proper line spacing
+                para.paragraph_format.line_spacing = 1.5
+                
+                # Add proper spacing between paragraphs, but not too much
+                para.paragraph_format.space_after = Pt(12)
+        
+        # Save the document
+        temp_docx = "temp_" + output_docx_file
+        doc.save(temp_docx)
+        
+        # Now we need to modify the Word XML directly to enable tategaki
+        # This is done by editing the document.xml file inside the .docx file (which is a zip)
+        
+        # Define XML namespace
+        w_namespace = '{http://schemas.openxmlformats.org/wordprocessingml/2006/main}'
+        
+        # Open the saved docx file as a zip
+        with zipfile.ZipFile(temp_docx, 'r') as zip_ref:
+            # Extract document.xml from the .docx
+            zip_ref.extract('word/document.xml')
+            
+            # Parse the XML - fix the missing parser parameter
+            parser = etree.XMLParser(recover=True)
+            tree = etree.parse('word/document.xml', parser)
+            root = tree.getroot()
+            
+            # Add vertical text orientation to the document section properties
+            # Find the section properties
+            for sectPr in root.findall('.//' + w_namespace + 'sectPr'):
+                # Add vertical text direction (if doesn't exist)
+                textDirection = sectPr.find(w_namespace + 'textDirection')
+                if textDirection is None:
+                    # Fix the missing nsmap parameter by using an empty dict for attrib and None for nsmap
+                    textDirection = etree.SubElement(sectPr, w_namespace + 'textDirection', {}, None)
+                textDirection.set(w_namespace + 'val', 'tbRl')  # Top to bottom, right to left
+                
+                # Set document grid for proper spacing (essential for Tategaki)
+                docGrid = sectPr.find(w_namespace + 'docGrid')
+                if docGrid is None:
+                    # Fix the missing nsmap parameter by using an empty dict for attrib and None for nsmap
+                    docGrid = etree.SubElement(sectPr, w_namespace + 'docGrid', {}, None)
+                docGrid.set(w_namespace + 'type', 'lines')
+                docGrid.set(w_namespace + 'linePitch', '360')  # 360 twips standard
+            
+            # Write the modified XML back
+            tree.write('word/document.xml', xml_declaration=True, encoding='UTF-8')
+            
+        # Create a new docx with the modified XML
+        with zipfile.ZipFile(output_docx_file, 'w') as outzip:
+            # Copy all the files from original docx
+            with zipfile.ZipFile(temp_docx, 'r') as inzip:
+                for item in inzip.infolist():
+                    if item.filename != 'word/document.xml':
+                        outzip.writestr(item, inzip.read(item.filename))
+            
+            # Add our modified document.xml
+            outzip.write('word/document.xml', 'word/document.xml')
+        
+        # Clean up temporary files
+        try:
+            os.remove(temp_docx)
+            os.remove('word/document.xml')
+            os.rmdir('word')
+        except:
+            pass
+        
+        print(f"✓ Tategaki document successfully created: {output_docx_file}")
+        print("  - The document is formatted for vertical Japanese text")
+        print("  - Standard B6 novel size (128mm × 182mm)")
+        print("  - 'MS Mincho' font for traditional Japanese novel appearance")
+        print("  - Proper paragraph and line spacing for fiction")
+        print("")
+        print("Note: The document should display properly in Microsoft Word.")
+        print("      If the text isn't vertical, go to Page Layout > Text Direction > Rotate all text 90°")
+        
+        return output_docx_file
+    except Exception as e:
+        print(f"Error creating tategaki document: {e}")
+        return None
+
+def load_checkpoint():
+    """Load checkpoint data if it exists"""
+    if os.path.exists(CHECKPOINT_FILE):
+        try:
+            with open(CHECKPOINT_FILE, 'r', encoding='utf-8') as f:
+                return json.load(f)
+        except (json.JSONDecodeError, IOError) as e:
+            print(f"Warning: Failed to load checkpoint file: {e}")
+            return None
+    return None
+
+def verify_output_file():
+    """Check if output file exists and is accessible"""
+    try:
+        if os.path.exists(OUTPUT_FILE):
+            with open(OUTPUT_FILE, 'a', encoding='utf-8') as f:
+                # Test if file is writable
+                f.write("")
+                f.flush()
+                os.fsync(f.fileno())
+            return True
+    except IOError as e:
+        print(f"Warning: Output file issue: {e}")
+        return False
+    return True
+
+def save_to_file(text, append=True):
+    """Save text to file with proper flushing to ensure it's written immediately"""
+    try:
+        mode = "a" if append else "w"
+        with open(OUTPUT_FILE, mode, encoding="utf-8") as f:
+            f.write(text)
+            f.flush()
+            os.fsync(f.fileno())  # Force write to disk
+        return True
+    except IOError as e:
+        print(f"Error writing to file: {e}")
+        return False
+
+def configure_api():
+    """Configure API settings through interactive prompts"""
+    global HF_API_URL, HF_MODEL, HF_TOKEN, HEADERS
+    
+    print("Current API Configuration:")
+    print(f"1. API URL: {HF_API_URL}")
+    print(f"2. Model: {HF_MODEL}")
+    print(f"3. API Token: {'[SET]' if HF_TOKEN else '[NOT SET]'}")
+    print("4. Continue with these settings")
+    print("5. Test current API connection")
+    
+    choice = input("Enter your choice (1-5): ").strip()
+    
+    if choice == "1":
+        new_url = input(f"Enter new API URL [{HF_API_URL}]: ").strip()
+        if new_url:
+            HF_API_URL = new_url
+        return configure_api()
+    elif choice == "2":
+        new_model = input(f"Enter model name [{HF_MODEL}]: ").strip()
+        if new_model:
+            HF_MODEL = new_model
+        return configure_api()
+    elif choice == "3":
+        new_token = input("Enter API token: ").strip()
+        if new_token:
+            HF_TOKEN = new_token
+            HEADERS = {"Authorization": f"Bearer {HF_TOKEN}"}
+        return configure_api()
+    elif choice == "5":
+        test_api_connection()
+        input("Press Enter to continue...")
+        return configure_api()
+    else:
+        # Option 4 or any other input: continue with current settings
+        return
+
+def main():
+    # Start the cloud backup thread
+    start_backup_thread()
+      # First, test the API connection
+    print("Testing API connection before starting translation...")
+    api_working = test_api_connection()
+    
+    if not api_working:
+        print("\nWARNING: API connection test failed. You may encounter problems during translation.")
+        print("Would you like to configure the API settings?")
+        if input("Configure API? (y/n): ").strip().lower() == 'y':
+            configure_api()
+    else:
+        print("\nAPI connection test successful!")
+        
+        # Test the template with a sample translation
+        print("\nWould you like to test the translation template?")
+        if input("Test template? (y/n): ").strip().lower() == 'y':
+            test_success = test_translation_template()
+            
+            if not test_success and not TRANSLATE_TEMPLATE_En:
+                print("\nTranslation test failed. Would you like to set a recommended template?")
+                if input("Set recommended template? (y/n): ").strip().lower() == 'y':
+                    # Set a recommended template that has demonstrated success
+                    TRANSLATE_TEMPLATE_En = (
+                        "[INST] You are a professional Japanese translator. Your task is to translate the following English text into natural, fluent Japanese.\n\n"
+                        "Translation style: Young adult fantasy novel for vertical writing (tategaki).\n"
+                        "Express subtle wonder, emotional depth, and a slightly melancholic tone.\n"
+                        "Use appropriate Japanese punctuation (「」for quotes, 。for periods, etc).\n"
+                        "Use natural Japanese expressions rather than literal translations.\n\n"
+                        "IMPORTANT: Return ONLY the Japanese translation. No explanations or English text.\n\n"
+                        "Text to translate: {text} [/INST]"
+                    )
+                    print("\nTemplate set. Testing again with new template...")
+                    test_translation_template()
+    
+    # Check for existing checkpoint
+    checkpoint = load_checkpoint()
+    resume_translation = False
+    
+    if checkpoint and os.path.exists(OUTPUT_FILE):
+        response = input(f"Found checkpoint from previous translation. Resume? (y/n): ").strip().lower()
+        resume_translation = response == 'y'
+    
+    if resume_translation and checkpoint:
+        docx_path = checkpoint['docx_path']
+        print(f"Resuming translation of {docx_path}")
+        
+        # We'll keep the existing output file
+        content_units_processed = checkpoint['content_units_processed']
+        paragraph_number = checkpoint['paragraph_number']
+        manuscript_title_count = checkpoint['manuscript_title_count']
+        chapter_title_count = checkpoint['chapter_title_count']
+        start_time_offset = checkpoint['elapsed_time']
+        # We'll adjust the start time later
+    else:
+        docx_path = input("Enter the full path to your DOCX manuscript: ").strip()
+        if not os.path.isfile(docx_path):
+            print(f"File not found: {docx_path}")
+            sys.exit(1)
+
+        # Clear output file at start of new translation
+        save_to_file("", append=False)
+        
+        content_units_processed = 0
+        paragraph_number = 0
+        manuscript_title_count = 0
+        chapter_title_count = 0
+        start_time_offset = 0
+
+    doc = docx.Document(docx_path)    # First pass: Count all meaningful content units (sentences and titles)
+    total_content_units = 0
+    total_paragraphs = 0
+    paragraph_positions = []  # Track positions of each paragraph for resuming
+    
+    for i, para in enumerate(doc.paragraphs):
+        text = para.text.strip()
+        if not text:
+            continue  # skip empty paragraphs
+        
+        if text.startswith("###") or text.startswith("##"):
+            # Titles count as 1 content unit each
+            total_content_units += 1
+            paragraph_positions.append({
+                'index': i, 
+                'type': 'title', 
+                'text': text
+            })
+        else:
+            # Regular paragraphs: count sentences
+            sentences = nltk.sent_tokenize(text)
+            total_content_units += len(sentences)
+            total_paragraphs += 1
+            paragraph_positions.append({
+                'index': i, 
+                'type': 'paragraph', 
+                'text': text, 
+                'sentence_count': len(sentences)
+            })
+
+    print(f"Document contains {total_content_units} content units to translate ({total_paragraphs} paragraphs)")
+    
+    # Initialize counters based on whether we're resuming or not
+    if not resume_translation:
+        paragraph_number = 0
+        manuscript_title_count = 0
+        chapter_title_count = 0
+        content_units_processed = 0
+        start_time_offset = 0
+    
+    # Adjust start time based on elapsed time from checkpoint
+    start_time = time.time() - start_time_offset
+    
+    para_idx = 0
+    try:
+        for para in doc.paragraphs:
+            text = para.text.strip()
+            if not text:
+                continue  # skip empty paragraphs
+            
+            # If we're resuming and haven't reached the checkpoint position, skip this paragraph
+            if resume_translation and checkpoint and para_idx < checkpoint.get('last_paragraph_index', 0):
+                para_idx += 1
+                continue
+
+            if text.startswith("###"):  # Manuscript title line
+                manuscript_title_count += 1
+                to_translate = text[3:].strip()
+                
+                # Update progress
+                content_units_processed += 1
+                percent_done = (content_units_processed / total_content_units) * 100
+                eta = calculate_eta(start_time, content_units_processed, total_content_units)
+                
+                print(f"Translating manuscript title {manuscript_title_count}: {to_translate}")
+                
+                try:
+                    jp_translation = translate_text(to_translate)
+                    print(f"Done: {content_units_processed}/{total_content_units} ({percent_done:.1f}%) ETA: {eta} [{jp_translation}]")
+                      # Remove markdown formatting for output file
+                    save_to_file(f"{jp_translation}\n\n")
+                    
+                    # Save checkpoint after each unit
+                    checkpoint_data = {
+                        'docx_path': docx_path,
+                        'content_units_processed': content_units_processed,
+                        'paragraph_number': paragraph_number,
+                        'manuscript_title_count': manuscript_title_count,
+                        'chapter_title_count': chapter_title_count,
+                        'last_paragraph_index': para_idx,
+                        'elapsed_time': time.time() - start_time
+                    }
+                    save_checkpoint(checkpoint_data)
+                    
+                except Exception as e:
+                    print(f"Error translating manuscript title {manuscript_title_count}: {e}")
+                    save_to_file(f"### [Translation error]\n\n")
+
+            elif text.startswith("##"):  # Chapter title line
+                chapter_title_count += 1
+                to_translate = text[2:].strip()
+                
+                # Update progress
+                content_units_processed += 1
+                percent_done = (content_units_processed / total_content_units) * 100
+                eta = calculate_eta(start_time, content_units_processed, total_content_units)
+                
+                print(f"Translating chapter title {chapter_title_count}: {to_translate}")
+                
+                try:
+                    jp_translation = translate_text(to_translate)
+                    print(f"Done: {content_units_processed}/{total_content_units} ({percent_done:.1f}%) ETA: {eta} [{jp_translation}]")
+                      # Remove markdown formatting for output file
+                    save_to_file(f"{jp_translation}\n\n")
+                    
+                    # Save checkpoint after each unit
+                    checkpoint_data = {
+                        'docx_path': docx_path,
+                        'content_units_processed': content_units_processed,
+                        'paragraph_number': paragraph_number,
+                        'manuscript_title_count': manuscript_title_count, 
+                        'chapter_title_count': chapter_title_count,
+                        'last_paragraph_index': para_idx,
+                        'elapsed_time': time.time() - start_time
+                    }
+                    save_checkpoint(checkpoint_data)
+                    
+                except Exception as e:
+                    print(f"Error translating chapter title {chapter_title_count}: {e}")
+                    save_to_file(f"## [Translation error]\n\n")
+
+            else:
+                # Only increment paragraph count for regular paragraphs
+                paragraph_number += 1
+                print(f"Processing paragraph {paragraph_number}...")
+                
+                # Regular paragraph: split into sentences
+                sentences = nltk.sent_tokenize(text)
+                
+                # If resuming, check if we need to skip some sentences in the current paragraph
+                sentence_start_idx = 0
+                if resume_translation and checkpoint and para_idx == checkpoint.get('last_paragraph_index', 0):
+                    # We might need to skip some sentences in this paragraph
+                    sentence_start_idx = checkpoint.get('last_sentence_index', -1) + 1
+                    
+                for i, sentence in enumerate(sentences):
+                    # Skip sentences we've already processed during resume
+                    if i < sentence_start_idx:
+                        continue
+                        
+                    # Update progress for each sentence
+                    content_units_processed += 1
+                    percent_done = (content_units_processed / total_content_units) * 100
+                    eta = calculate_eta(start_time, content_units_processed, total_content_units)
+                    
+                    print(f"Translating sentence {i+1}/{len(sentences)} of paragraph {paragraph_number}...")
+                    
+                    try:
+                        jp_translation = translate_text(sentence)
+                        print(f"Done: {content_units_processed}/{total_content_units} ({percent_done:.1f}%) ETA: {eta} [{jp_translation}]")
+                        
+                        # Write each sentence immediately and flush to disk
+                        save_to_file(jp_translation + "\n")
+                        
+                        # Save checkpoint after each sentence
+                        checkpoint_data = {
+                            'docx_path': docx_path,
+                            'content_units_processed': content_units_processed,
+                            'paragraph_number': paragraph_number,
+                            'manuscript_title_count': manuscript_title_count,
+                            'chapter_title_count': chapter_title_count,
+                            'last_paragraph_index': para_idx,
+                            'last_sentence_index': i,
+                            'elapsed_time': time.time() - start_time
+                        }
+                        save_checkpoint(checkpoint_data)
+                        
+                    except Exception as e:
+                        print(f"Error translating sentence {i+1} of paragraph {paragraph_number}: {e}")
+                        save_to_file("[Translation error]\n")
+                
+                # Paragraph break
+                save_to_file("\n")
+            
+            para_idx += 1
+    except KeyboardInterrupt:
+        # Handle user interruption gracefully
+        print("\nTranslation paused. You can resume later.")
+        elapsed = time.time() - start_time
+        print(f"Progress: {content_units_processed}/{total_content_units} ({content_units_processed/total_content_units*100:.1f}%)")
+        print(f"Time elapsed so far: {str(timedelta(seconds=int(elapsed)))}")
+        
+        # Perform backup before exiting
+        if os.path.exists(OUTPUT_FILE):
+            print("Performing backup to Google Cloud Storage before exit...")
+            subprocess.run(["gsutil", "cp", OUTPUT_FILE, GCS_BUCKET])
+            
+        # Stop the backup thread before exiting
+        stop_backup_thread()
+        sys.exit(0)
+    except Exception as e:
+        # Handle any other exceptions
+        print(f"\nError during translation: {e}")
+        
+        # Perform backup before exiting
+        if os.path.exists(OUTPUT_FILE):
+            print("Performing backup to Google Cloud Storage before exit...")
+            subprocess.run(["gsutil", "cp", OUTPUT_FILE, GCS_BUCKET])
+            
+        # Stop the backup thread before exiting
+        stop_backup_thread()
+        raise
+    
+    # Translation complete - clean up checkpoint file
+    if os.path.exists(CHECKPOINT_FILE):
+        try:
+            os.remove(CHECKPOINT_FILE)
+            print("Checkpoint file removed as translation is complete.")
+        except:
+            pass
+    
+    total_time = time.time() - start_time
+    hours, remainder = divmod(total_time, 3600)
+    minutes, seconds = divmod(remainder, 60)
+    
+    # Perform one final backup before stopping the thread
+    if os.path.exists(OUTPUT_FILE):
+        print("Performing final backup to Google Cloud Storage...")
+        subprocess.run(["gsutil", "cp", OUTPUT_FILE, GCS_BUCKET])
+      # Stop the backup thread
+    stop_backup_thread()
+    
+    print(f"\nTranslation complete! Output written to {OUTPUT_FILE}")
+    print(f"Statistics: {manuscript_title_count} manuscript title(s), {chapter_title_count} chapter title(s), {paragraph_number} paragraphs")
+    print(f"Total content units: {content_units_processed}/{total_content_units}")
+    print(f"Total time taken: {int(hours)}h {int(minutes)}m {int(seconds)}s")
+
+    # Create tategaki Word document
+    create_tategaki_document(OUTPUT_FILE)
+
+if __name__ == "__main__":
+    main()
+``` 
