@@ -282,9 +282,7 @@ def normalize_punctuation(text):
         '(': '（',    # Opening parenthesis to full-width
         ')': '）',    # Closing parenthesis to full-width
         '"': '「',    # Opening quote to Japanese opening quote
-        '"': '」',    # Closing quote to Japanese closing quote
-        "'": '『',    # Opening single quote to Japanese nested opening quote
-        "'": '』',    # Closing single quote to Japanese nested closing quote
+        "'": '」',    # Closing quote to Japanese closing quote
         ':': '：',    # Colon to full-width
         ';': '；',    # Semicolon to full-width
         '-': 'ー',    # Hyphen to Japanese long vowel mark
@@ -810,14 +808,14 @@ def create_tategaki_document(output_text_file, output_docx_file="JP_tategaki.doc
                 textDirection = sectPr.find(w_namespace + 'textDirection')
                 if textDirection is None:
                     # Fix the missing nsmap parameter by using an empty dict for attrib and None for nsmap
-                    textDirection = etree.SubElement(sectPr, w_namespace + 'textDirection', {}, None)
+                    textDirection = etree.SubElement(sectPr, w_namespace + 'textDirection', attrib={}, nsmap=None)
                 textDirection.set(w_namespace + 'val', 'tbRl')  # Top to bottom, right to left
                 
                 # Set document grid for proper spacing (essential for Tategaki)
                 docGrid = sectPr.find(w_namespace + 'docGrid')
                 if docGrid is None:
                     # Fix the missing nsmap parameter by using an empty dict for attrib and None for nsmap
-                    docGrid = etree.SubElement(sectPr, w_namespace + 'docGrid', {}, None)
+                    docGrid = etree.SubElement(sectPr, w_namespace + 'docGrid', attrib={}, nsmap=None)
                 docGrid.set(w_namespace + 'type', 'lines')
                 docGrid.set(w_namespace + 'linePitch', '360')  # 360 twips standard
             
@@ -1235,4 +1233,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-``` 
