@@ -70,30 +70,49 @@ if not HF_TOKEN:
     print("Please set the HF_TOKEN environment variable")
     sys.exit(1)
 
-# Translation template environment variables
-TRANSLATE_TEMPLATE_En = os.getenv("TRANSLATE_TEMPLATE_En", "")
-TRANSLATE_TEMPLATE_Ja = os.getenv("TRANSLATE_TEMPLATE_Ja", "")
+# Translation template environment variables - using chat-style prompts based on gemma-2-2b-jpn-it-translate model
+TRANSLATE_TEMPLATE_En = os.getenv("TRANSLATE_TEMPLATE_En", """<start_of_turn>user
+You are a highly skilled professional Japanese-English and English-Japanese translator. Translate the given text accurately, taking into account the context and specific instructions provided.
+
+Translate English to Japanese.
+When translating, please use the following hints:
+[writing_style: young adult fantasy novel, tategaki (vertical writing)]
+[tone: subtle wonder, emotional depth, slightly melancholic]
+[punctuation: Japanese style (「」for quotes, 。for periods)]
+
+IMPORTANT: Return ONLY the Japanese translation. No explanations, no English text.
+
+{text}<end_of_turn>
+<start_of_turn>model
+""")
+
+TRANSLATE_TEMPLATE_Ja = os.getenv("TRANSLATE_TEMPLATE_Ja", """<start_of_turn>user
+You are a highly skilled professional Japanese-English and English-Japanese translator. Translate the given text accurately, taking into account the context and specific instructions provided.
+
+Translate Japanese to English.
+When translating, please use the following hints:
+[writing_style: young adult fantasy novel]
+[tone: subtle wonder, emotional depth, slightly melancholic]
+
+IMPORTANT: Return ONLY the English translation. No explanations, no Japanese text.
+
+{text}<end_of_turn>
+<start_of_turn>model
+""")
 
 def check_translation_templates():
-    """Check for translation templates in environment variables and set up defaults if needed"""
+    """Check for translation templates in environment variables"""
     global TRANSLATE_TEMPLATE_En, TRANSLATE_TEMPLATE_Ja
     
-    # Check if environment variable is set
-    if not TRANSLATE_TEMPLATE_En:
-        print("\nNOTE: TRANSLATE_TEMPLATE_En environment variable not set.")
-        print("For best results, set this environment variable with a template like:")
-        print("-------------------------------------------------------------------")
-        print('TRANSLATE_TEMPLATE_En="[INST] You are a professional Japanese translator. Your task is to translate the following English text into natural, fluent Japanese.\n\nTranslation style: Young adult fantasy novel for vertical writing (tategaki).\nExpress subtle wonder, emotional depth, and a slightly melancholic tone.\nUse appropriate Japanese punctuation (「」for quotes, 。for periods, etc).\nUse natural Japanese expressions rather than literal translations.\n\nIMPORTANT: Return ONLY the Japanese translation. No explanations or English text.\n\nText to translate: {text} [/INST]"')
-        print("-------------------------------------------------------------------")
-        print("Using a default template for now. Set the environment variable for best results.\n")
-    else:
-        print("Found TRANSLATE_TEMPLATE_En in environment variables.")
-        
     # Check template format
-    if TRANSLATE_TEMPLATE_En and "{text}" not in TRANSLATE_TEMPLATE_En:
-        print("WARNING: TRANSLATE_TEMPLATE_En must contain {text} placeholder. Using default template.")
-        TRANSLATE_TEMPLATE_En = ""
-        
+    for template_name, template in [("TRANSLATE_TEMPLATE_En", TRANSLATE_TEMPLATE_En), 
+                                   ("TRANSLATE_TEMPLATE_Ja", TRANSLATE_TEMPLATE_Ja)]:
+        if "{text}" not in template:
+            print(f"WARNING: {template_name} must contain {{text}} placeholder. Using default template.")
+            # Default templates are already set during initialization
+        else:
+            print(f"Using {template_name} template from environment variables.")
+    
     return True
 
 # Check translation templates
@@ -149,17 +168,23 @@ def test_api_connection():
 
 def test_translation_template():
     """Test the translation with the current template"""
-    global TRANSLATE_TEMPLATE_En
+    global TRANSLATE_TEMPLATE_En, TRANSLATE_TEMPLATE_Ja
     
     print("\nTesting translation with current template...")
     print(f"Using API endpoint: {HF_API_URL}")
     print(f"Using model: {HF_MODEL}")
     
+    # Show the current template structure
+    print("\nCurrent English→Japanese Template Structure:")
+    print("--------------------------------------------")
+    print(TRANSLATE_TEMPLATE_En[:150] + "...")
+    
     # Simple test phrase
-    test_text = "The old maple tree whispered secrets as the autumn breeze passed through its branches."
+    test_text = "The maple tree whispered secrets as the autumn wind danced through its branches."
     
     try:
         # Translate the test phrase
+        print(f"\nTranslating: \"{test_text}\"")
         translated = translate_text(test_text)
         
         # Check if translation succeeded
@@ -169,6 +194,13 @@ def test_translation_template():
             print("\n✓ Translation test successful!")
             print(f"Input:  {test_text}")
             print(f"Output: {translated}")
+            
+            # Test Japanese to English if we have a template for it
+            if TRANSLATE_TEMPLATE_Ja:
+                print("\nTesting reverse direction (Japanese→English)...")
+                reverse_translation = translate_text(translated)
+                print(f"Re-translated: {reverse_translation}")
+            
             return True
         else:
             print("\n✗ Translation test failed. No Japanese characters in output.")
@@ -282,7 +314,9 @@ def normalize_punctuation(text):
         '(': '（',    # Opening parenthesis to full-width
         ')': '）',    # Closing parenthesis to full-width
         '"': '「',    # Opening quote to Japanese opening quote
-        "'": '」',    # Closing quote to Japanese closing quote
+        '"': '」',    # Closing quote to Japanese closing quote
+        "'": '『',    # Opening single quote to Japanese nested opening quote
+        "'": '』',    # Closing single quote to Japanese nested closing quote
         ':': '：',    # Colon to full-width
         ';': '；',    # Semicolon to full-width
         '-': 'ー',    # Hyphen to Japanese long vowel mark
@@ -305,13 +339,8 @@ def normalize_punctuation(text):
 
 def clean_translation_output(text):
     """
-    Clean up the translation output to extract only the Japanese text.
-    Removes formatting markers, prefixes, and other non-translation content.
-    
-    More robust handling of different response types:
-    1. Structured responses with markers (e.g. "**Japanese Translation:**")
-    2. Mixed language responses (extract only Japanese parts)
-    3. Pure English responses (return error message)
+    Clean up the translation output to extract only the translated text.
+    Simplified to work with the chat-format templates.
     """
     # Helper function to check if a character is Japanese
     def is_japanese_char(char):
@@ -324,223 +353,82 @@ def clean_translation_output(text):
     def is_japanese_punct(char):
         return char in "「」『』（）！？。、：；"
     
+    # For our chat format, we can handle the output more straightforwardly
+    # Remove any [end of text] marker that might be added by some models
+    text = text.replace("[end of text]", "").strip()
+    
+    # If the model fully followed our template format with "<end_of_turn>", parse that out
+    if "<end_of_turn>" in text:
+        text = text.split("<end_of_turn>")[0].strip()
+    
     # First, check if there are any Japanese characters in the response
     has_japanese = any(is_japanese_char(char) for char in text)
+    is_english_to_japanese = has_japanese  # We can infer the direction from the response content
     
-    if not has_japanese:
+    # For English translation from Japanese
+    if not is_english_to_japanese and not text.strip():
+        return "［Translation Error］"
+    
+    # For Japanese translation from English
+    if is_english_to_japanese and not has_japanese:
         print(f"WARNING: No Japanese characters found in the response: {text[:100]}...")
         return "［翻訳エラー］"  # Japanese for [translation error]
     
-    # Calculate the Japanese character ratio
-    jp_char_count = sum(1 for char in text if is_japanese_char(char) or is_japanese_punct(char))
-    total_chars = len(text.strip())
-    jp_ratio = jp_char_count / total_chars if total_chars > 0 else 0
+    # Basic cleanup
+    cleaned_text = text.strip()
+    if (cleaned_text.startswith('"') and cleaned_text.endswith('"')) or \
+        (cleaned_text.startswith("'") and cleaned_text.endswith("'")):
+        cleaned_text = cleaned_text[1:-1].strip()
     
-    # Very clean response (mostly Japanese) - just do basic cleanup
-    if jp_ratio > 0.7:  # If more than 70% is Japanese, it's likely a clean response
-        # Just strip and remove unnecessary quotes
-        cleaned_text = text.strip()
-        if (cleaned_text.startswith('"') and cleaned_text.endswith('"')) or \
-           (cleaned_text.startswith("'") and cleaned_text.endswith("'")):
-            cleaned_text = cleaned_text[1:-1].strip()
-        return cleaned_text
+    # Remove any "[end of text]" marker that might be added by the model
+    cleaned_text = cleaned_text.replace("[end of text]", "").strip()
     
-    # Common patterns to remove from model output
-    patterns = [
-        # Match anything with "Original Sentence:" or "Japanese Translation:" markers
-        r'\*\*Original Sentence[：:]\*\*.*?(?=\*\*Japanese Translation[：:]\*\*|\Z)',
-        r'\*\*Japanese Translation[：:]\*\*\s*',
-        r'\*\*[^*]+?\*\*',  # Any **text** format markers
-        r'##\s*Japanese\s*Translation[：:]\s*',  # Section headers
-        r'##\s*[^#]+',  # Any ## header format
-        r'Japanese Translation[：:]',  # Plain text markers
-        r'Translation[：:]',  # More general translation markers
-        r'.*?(?=日本語|[ぁ-んァ-ン])',  # Match everything up to first Japanese character
-    ]
-    
-    # Check if the text contains markers that indicate a structured response
-    has_markers = any(re.search(pattern, text) for pattern in [
-        r'\*\*Japanese Translation', 
-        r'##\s*Japanese\s*Translation',
-        r'Japanese Translation[：:]',
-        r'Translation[：:]'
-    ])
-    
-    # Try to extract Japanese text using different methods
-    extracted_text = None
-    
-    # 1. MARKER-BASED EXTRACTION
-    if has_markers:
-        cleaned_text = text
-        for pattern in patterns:
-            cleaned_text = re.sub(pattern, '', cleaned_text, flags=re.DOTALL)
+    # For Japanese translations, apply normalization
+    if is_english_to_japanese:
+        cleaned_text = normalize_punctuation(cleaned_text)
         
-        # If we got good Japanese content, use it
-        jp_char_count = sum(1 for char in cleaned_text if is_japanese_char(char))
-        if jp_char_count > 10:  # Arbitrary threshold for "enough" Japanese text
-            extracted_text = cleaned_text
+        # Verify we have enough Japanese characters in the final result
+        jp_char_count = sum(1 for char in cleaned_text if is_japanese_char(char) or is_japanese_punct(char))
+        if jp_char_count < 5:  # Arbitrary threshold for "enough" Japanese text
+            print(f"WARNING: Too few Japanese characters in cleaned output: {cleaned_text}")
+            return "［翻訳エラー］"  # Japanese for [translation error]
     
-    # 2. SENTENCE-BASED EXTRACTION
-    if not extracted_text:
-        # Find continuous Japanese segments with Japanese punctuation
-        japanese_segments = re.findall(r'[「」『』（）！？。、]?[^\n\r]+?[「」『』（）！？。、]', text)
-        
-        if japanese_segments:
-            # Filter segments to only those with Japanese characters
-            japanese_segments = [
-                seg for seg in japanese_segments 
-                if any(is_japanese_char(char) for char in seg)
-            ]
-            
-            if japanese_segments:
-                extracted_text = "".join(japanese_segments)
-    
-    # 3. LINE-BASED EXTRACTION
-    if not extracted_text:
-        lines = text.split('\n')
-        japanese_lines = []
-        
-        for line in lines:
-            # Count Japanese characters in this line
-            jp_chars = sum(1 for c in line if is_japanese_char(c))
-            
-            # If there are Japanese characters and the line is mostly Japanese or contains sentences
-            if jp_chars > 0 and ('。' in line or '！' in line or '？' in line or jp_chars / len(line) > 0.3):
-                # Extract just Japanese segments within this line
-                jp_segments = re.findall(r'[「」『』（）！？。、]?[^a-zA-Z\(\)]+[「」『』（）！？。、]?', line)
-                if jp_segments:
-                    japanese_lines.append("".join(jp_segments))
-                else:
-                    japanese_lines.append(line)
-        
-        if japanese_lines:
-            extracted_text = '\n'.join(japanese_lines)
-    
-    # 4. CHARACTER-BY-CHARACTER EXTRACTION (last resort)
-    if not extracted_text:
-        # Extract continuous Japanese characters sequences
-        japanese_parts = []
-        current_part = []
-        
-        for char in text:
-            if is_japanese_char(char) or is_japanese_punct(char) or char.isspace():
-                current_part.append(char)
-            elif current_part:  # End of a Japanese segment
-                segment = ''.join(current_part).strip()
-                if any(is_japanese_char(c) for c in segment):
-                    japanese_parts.append(segment)
-                current_part = []
-        
-        # Don't forget the last segment
-        if current_part:
-            segment = ''.join(current_part).strip()
-            if any(is_japanese_char(c) for c in segment):
-                japanese_parts.append(segment)
-        
-        if japanese_parts:
-            extracted_text = ' '.join(japanese_parts)
-    
-    # Use the extracted text if we found any, otherwise use the original
-    final_text = extracted_text if extracted_text else text
-    
-    # Final cleanup
-    final_text = final_text.strip()
-    
-    # Remove any remaining English phrases in parentheses - common in translations
-    final_text = re.sub(r'\([^)]*[a-zA-Z][^)]*\)', '', final_text)
-    
-    # If final text is still wrapped in quotes, remove them
-    if (final_text.startswith('"') and final_text.endswith('"')) or \
-       (final_text.startswith("'") and final_text.endswith("'")):
-        final_text = final_text[1:-1].strip()
-    
-    # If we don't have enough Japanese characters in the final result, return error
-    jp_char_count = sum(1 for char in final_text if is_japanese_char(char))
-    if jp_char_count < 5:  # Arbitrary threshold for "enough" Japanese text
-        print(f"WARNING: Too few Japanese characters in cleaned output: {final_text}")
-        return "［翻訳エラー］"  # Japanese for [translation error]
-    
-    return final_text
+    return cleaned_text
 
 def build_translation_prompt(text_to_translate, model_name=None):
     """Build an appropriate translation prompt based on model type"""
     global TRANSLATE_TEMPLATE_En, TRANSLATE_TEMPLATE_Ja
     
-    # If environment variable template is available, use it
-    if TRANSLATE_TEMPLATE_En:
-        # Replace {text} with the actual text to translate
-        return TRANSLATE_TEMPLATE_En.replace("{text}", text_to_translate)
-    # If Japanese template is available and we detect Japanese input
-    elif TRANSLATE_TEMPLATE_Ja and any(0x3000 <= ord(char) <= 0x9FFF for char in text_to_translate):
-        return TRANSLATE_TEMPLATE_Ja.replace("{text}", text_to_translate)
+    # Detect if text is Japanese to choose appropriate template
+    is_japanese = any(0x3000 <= ord(char) <= 0x9FFF for char in text_to_translate)
     
-    # Otherwise, use model-specific templates
-    # For Mistral and similar instruction models
-    elif model_name and ("mistral" in model_name.lower() or "llama" in model_name.lower() or 
-                       "gemma" in model_name.lower() or "mixtral" in model_name.lower()):
-        return (
-            "[INST] You are a professional Japanese translator. Translate this English text to Japanese:\n\n"
-            "Translation style: Young adult fantasy novel for vertical writing (tategaki). "
-            "Express subtle wonder, emotional depth, and a slightly melancholic tone.\n"
-            "IMPORTANT: Output Japanese text ONLY. No explanations or English text.\n\n"
-            f"Text to translate: {text_to_translate} [/INST]"
-        )
-    # For Claude-like models
-    elif model_name and "claude" in model_name.lower():
-        return (
-            "Human: You are a professional Japanese translator. Translate this English text to Japanese:\n\n"
-            "Translation style: Young adult fantasy novel for vertical writing (tategaki). "
-            "Express subtle wonder, emotional depth, and a slightly melancholic tone.\n"
-            "IMPORTANT: Output Japanese text ONLY. No explanations or English text.\n\n"
-            f"Text to translate: {text_to_translate}\n\n"
-            "Assistant: "
-        )
-    # For GPT-like models or default
-    else:
-        return (
-            "あなたは優秀な日本語翻訳者です。次の英語の文章を日本語に翻訳してください。\n\n"
-            "翻訳スタイルは日本の若者向けファンタジー小説（縦書き用）です。微妙な不思議さ、感情の深さ、"
-            "少し風変わりで物悲しい調子を表現しつつ、そのジャンルのために書かれたかのように自然に言葉が流れるようにしてください。\n\n"
-            "回答は日本語の翻訳のみを提供してください。フォーマット、説明、英語のテキストは含めないでください。\n\n"
-            "翻訳する文章：\n" + text_to_translate + "\n\n"
-            "日本語翻訳："
-        )
+    # Use the appropriate template based on detected language
+    template = TRANSLATE_TEMPLATE_Ja if is_japanese else TRANSLATE_TEMPLATE_En
+    
+    # Replace {text} with the actual text to translate
+    return template.replace("{text}", text_to_translate)
 
 def translate_text(text_to_translate, max_retries=3, retry_delay=5):
     """Translate text with retry logic for API failures and model fallback"""
-    global HF_API_URL, HF_MODEL, TRANSLATE_TEMPLATE_En
+    global HF_API_URL, HF_MODEL
     
     # Try with primary model first
     current_model = HF_MODEL
     models_to_try = [current_model] + BACKUP_MODELS
     
-    # Check if environment variable template is available - if not, set a recommended one
-    if not TRANSLATE_TEMPLATE_En:
-        print("Note: TRANSLATE_TEMPLATE_En environment variable not set. Using default template.")
-        # You may want to suggest setting this environment variable
-        recommended_template = (
-            "[INST] You are a professional Japanese translator. Your task is to translate the following English text into natural, fluent Japanese.\n\n"
-            "Translation style: Young adult fantasy novel for vertical writing (tategaki).\n"
-            "Express subtle wonder, emotional depth, and a slightly melancholic tone.\n"
-            "Use appropriate Japanese punctuation (「」for quotes, 。for periods, etc).\n"
-            "Use natural Japanese expressions rather than literal translations.\n\n"
-            "IMPORTANT: Return ONLY the Japanese translation. No explanations or English text.\n\n"
-            "Text to translate: {text} [/INST]"
-        )
-        # We'll use this for now but won't permanently set the env var
-        TRANSLATE_TEMPLATE_En = recommended_template
+    # Build the prompt using our standardized template system
+    prompt = build_translation_prompt(text_to_translate)
     
     for model_index, model in enumerate(models_to_try):
-        # Build appropriate prompt for the model
-        prompt = build_translation_prompt(text_to_translate, model)
-        
+        # For gemma and similar models, following the notebook example settings
         payload = {
             "inputs": prompt,
             "parameters": {
                 "max_new_tokens": 1024,
                 "return_full_text": False,
-                "temperature": 0.7,
-                "top_p": 0.95,
+                "temperature": 0, # Use temperature=0 for more consistent translation results
+                "top_p": 0.9,
+                "repeat_penalty": 1.0, # Disable repetition penalty for instruction-tuned models
             },
         }
         
@@ -808,14 +696,14 @@ def create_tategaki_document(output_text_file, output_docx_file="JP_tategaki.doc
                 textDirection = sectPr.find(w_namespace + 'textDirection')
                 if textDirection is None:
                     # Fix the missing nsmap parameter by using an empty dict for attrib and None for nsmap
-                    textDirection = etree.SubElement(sectPr, w_namespace + 'textDirection', attrib={}, nsmap=None)
+                    textDirection = etree.SubElement(sectPr, w_namespace + 'textDirection', {}, None)
                 textDirection.set(w_namespace + 'val', 'tbRl')  # Top to bottom, right to left
                 
                 # Set document grid for proper spacing (essential for Tategaki)
                 docGrid = sectPr.find(w_namespace + 'docGrid')
                 if docGrid is None:
                     # Fix the missing nsmap parameter by using an empty dict for attrib and None for nsmap
-                    docGrid = etree.SubElement(sectPr, w_namespace + 'docGrid', attrib={}, nsmap=None)
+                    docGrid = etree.SubElement(sectPr, w_namespace + 'docGrid', {}, None)
                 docGrid.set(w_namespace + 'type', 'lines')
                 docGrid.set(w_namespace + 'linePitch', '360')  # 360 twips standard
             
