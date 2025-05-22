@@ -426,7 +426,7 @@ def translate_text(text_to_translate, max_retries=3, retry_delay=5):
             "parameters": {
                 "max_new_tokens": 1024,
                 "return_full_text": False,
-                "temperature": 0, # Use temperature=0 for more consistent translation results
+                "temperature": 0.5, # Use temperature=0 for more consistent translation results
                 "top_p": 0.9,
                 "repeat_penalty": 1.0, # Disable repetition penalty for instruction-tuned models
             },
