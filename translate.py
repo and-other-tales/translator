@@ -126,6 +126,7 @@ def save_to_file(text, append=True):
         f.write(text)
         f.flush()
         os.fsync(f.fileno())  # Force write to disk
+    print(f"Text written to file: {text}")
 
 def main():
     docx_path = input("Enter the full path to your DOCX manuscript: ").strip()
